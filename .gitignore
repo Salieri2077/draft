@@ -1,0 +1,4 @@
+# 忽略 dataset 下的所有内容
+dataset/*
+# 但是！不忽略 .gitkeep 文件 (这是一个空文件，用来占位)
+!dataset/.gitkeep
