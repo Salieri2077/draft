@@ -38,3 +38,23 @@ class BatchNorm(nn.Module):
         out,global_mean,global_var = batch_norm(x,self.beta,self.gamma,eps=1e-5,
                                                 global_var=self.global_var,global_mean=self.global_mean,momentum=0.9)
         return out
+    
+
+if __name__ == "__main__":
+    
+    # 假设输入图片尺寸为 32x32
+    hight = 32
+    width = 32
+    last_channel_output = 32
+    fc_in_features = hight * width * last_channel_output
+    net = nn.Sequential(
+        nn.Conv2d(input=3,output=16,kernel_size = 3,stride=1,padding=1),
+        BatchNorm(num_features=16,num_dims=4),
+        nn.ReLU(),
+        nn.Conv2d(input=16,output=last_channel_output,kernel_size = 3,stride=1,padding=1),
+        BatchNorm(num_features=last_channel_output,num_dims=4),
+        nn.ReLU(),
+        nn.Flatten(),
+        nn.Linear(in_feature=fc_in_features,out_feature=10),
+        BatchNorm(num_features=10,num_dims=2)
+    )
