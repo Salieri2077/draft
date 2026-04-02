@@ -1,0 +1,490 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import os
+import sys
+
+# 添加项目根目录到 Python 路径，使得可以从任何位置运行脚本
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(script_dir, '../..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.dataset.PCATokenizer import PCATokenizer
+
+# 假设你的 datas 是一个 numpy array 或 list，形状为 [N, 25, 3]
+# 假设 new_tokenizer 已经初始化完成
+# num_components = 15 # 你当前使用的 PCA 组件数
+
+
+def find_worst_samples(errors):
+    var_names = ['dx', 'dy', 'dyaw']
+    worst_samples = {}
+
+    print(f"当前数据总量: {errors.shape[0]}, 时间步: {errors.shape[1]}, 变量数: {errors.shape[2]}")
+    print("-" * 60)
+
+    for i, var in enumerate(var_names):
+        # 1. 提取当前变量的所有误差数据 [N, 25]
+        # data_var.shape = (N, 25)
+        data_var = errors[:, :, i]
+
+        # 2. 找到最大值所在的索引
+        max_val_idx = np.argmax(data_var)
+        sample_idx, time_step = np.unravel_index(max_val_idx, data_var.shape)
+        
+        # 3. 提取出该样本对应的完整误差轨迹 [25, 3]
+        worst_sample_errors = errors[sample_idx]
+        
+        worst_samples[var] = worst_sample_errors
+        
+        # 打印信息
+        max_val = data_var[sample_idx, time_step]
+        print(f"【{var} 误差最大的样本】")
+        print(f"  - 样本索引 (Index): {sample_idx}")
+        print(f"  - 发生时间步 (TimeStep): {time_step}")
+        print(f"  - 最大误差值: {max_val:.6f}")
+        print(f"  - 该样本的完整误差形状: {worst_sample_errors}")
+        print("-" * 60)
+
+    return worst_samples
+
+def evaluate_pca_reconstruction(dataset, tokenizer, num_components=15, time_horizon=None):
+    """
+    遍历数据集，计算 PCA 重建误差，并按时间步和变量进行统计分析。
+    
+    Args:
+        dataset: 轨迹数据集
+        tokenizer: PCATokenizer 实例
+        num_components: token数量
+        time_horizon: 时间步数，如果为None则从第一个样本自动推断
+    """
+    errors = []
+    # rm_idxs = [32560, 7496, ]
+    # dataset = np.delete(dataset, rm_idxs, axis=0)
+    if len(dataset) > 157172:
+        print(dataset[157172])
+    if len(dataset) > 280750:
+        print(dataset[280750])
+    if len(dataset) > 338104:
+        print(dataset[338104])
+    
+    print(f"开始评估全量数据，样本数: {len(dataset)}，使用组件数: {num_components}...")
+    
+    # 1. 遍历数据集计算残差
+    # 使用 tqdm 显示进度条
+    actual_time_horizon = None
+    for sample in tqdm(dataset, desc="Encoding/Decoding"):
+        # 确保 sample 是 numpy 数组
+        sample = np.array(sample)
+        
+        # 编码 + 解码
+        # 注意：这里假设 tokenizer 的输入输出不需要 batch 维度，如果是 batch 处理请自行调整
+        tokens = tokenizer(sample, num_components=num_components)
+        recon = tokenizer.decode(tokens, num_components=num_components)[0]
+        
+        # 调试信息：打印形状
+        if actual_time_horizon is None:
+            print(f"样本形状: {sample.shape}, 解码后形状: {recon.shape}, token数量: {num_components}")
+        
+        # 获取实际的时间步数（从解码结果推断）
+        if actual_time_horizon is None:
+            import pdb; pdb.set_trace()
+            actual_time_horizon = recon.shape[0]
+            print(f"检测到时间步数: {actual_time_horizon}")
+        
+        # 计算绝对误差 |True - Pred|
+        # 确保sample和recon的长度一致（取较小值）
+        min_len = min(sample.shape[0], recon.shape[0])
+        if min_len == 0:
+            print(f"警告: sample或recon长度为0, sample.shape={sample.shape}, recon.shape={recon.shape}")
+            continue
+        
+        abs_error = np.abs(sample[:min_len] - recon[:min_len])
+        # 确保abs_error是2D数组 [T, 3]
+        if abs_error.ndim == 1:
+            abs_error = abs_error.reshape(-1, 3)
+        
+        # 调试信息：打印第一个样本的误差形状
+        if len(errors) == 0:
+            print(f"第一个误差数组形状: {abs_error.shape}")
+        
+        errors.append(abs_error)
+    
+    # 将列表转换为巨大的 numpy 数组: [N_samples, T, 3]
+    # 使用实际的时间步数
+    if time_horizon is None:
+        if actual_time_horizon is not None:
+            time_horizon = actual_time_horizon
+        elif len(errors) > 0:
+            # 从所有误差数组中找出最大长度
+            max_len = max(err.shape[0] for err in errors)
+            time_horizon = max_len
+            print(f"从误差数组中推断时间步数: {time_horizon}")
+        else:
+            time_horizon = 14  # 默认值
+            print(f"使用默认时间步数: {time_horizon}")
+    
+    print(f"使用的时间步数: {time_horizon}")
+    
+    # 确保所有误差数组长度一致，并确保每个都是2D数组 [T, 3]
+    errors_aligned = []
+    for idx, err in enumerate(errors):
+        # 确保err是2D数组
+        if err.ndim == 1:
+            err = err.reshape(-1, 3)
+        elif err.ndim == 3:
+            # 如果是3D，取第一个batch或squeeze
+            err = err.squeeze()
+            if err.ndim == 2:
+                pass  # 已经是2D
+            elif err.ndim == 1:
+                err = err.reshape(-1, 3)
+            else:
+                raise ValueError(f"Unexpected error shape: {err.shape}")
+        
+        # 确保最后一维是3
+        if err.shape[-1] != 3:
+            raise ValueError(f"Expected last dimension to be 3, got {err.shape}")
+        
+        # 对齐长度
+        if err.shape[0] < time_horizon:
+            # 如果长度不足，用最后一个值填充
+            padding = np.tile(err[-1:], (time_horizon - err.shape[0], 1))
+            err = np.concatenate([err, padding], axis=0)
+        elif err.shape[0] > time_horizon:
+            # 如果长度超出，截断
+            err = err[:time_horizon]
+        
+        # 确保最终是 [T, 3] 形状
+        if err.shape != (time_horizon, 3):
+            # 如果reshape失败，说明数据有问题
+            if err.size != time_horizon * 3:
+                print(f"警告: 样本{idx}的误差数组大小不匹配: {err.shape}, 期望: ({time_horizon}, 3)")
+                # 尝试reshape，如果失败则跳过或使用填充
+                try:
+                    err = err.reshape(time_horizon, 3)
+                except ValueError:
+                    # 如果无法reshape，用零填充或截断
+                    if err.size < time_horizon * 3:
+                        # 填充零
+                        padding_size = time_horizon * 3 - err.size
+                        err_flat = err.flatten()
+                        err_flat = np.pad(err_flat, (0, padding_size), mode='constant', constant_values=0)
+                        err = err_flat.reshape(time_horizon, 3)
+                    else:
+                        # 截断
+                        err_flat = err.flatten()[:time_horizon * 3]
+                        err = err_flat.reshape(time_horizon, 3)
+            else:
+                err = err.reshape(time_horizon, 3)
+        
+        # 最终验证
+        if err.shape != (time_horizon, 3):
+            raise ValueError(f"无法将误差数组调整为 ({time_horizon}, 3), 当前形状: {err.shape}")
+        
+        errors_aligned.append(err)
+    
+    # 确保errors_aligned不为空
+    if len(errors_aligned) == 0:
+        raise ValueError("No errors collected, dataset might be empty")
+    
+    # 使用np.stack或np.array确保正确的形状
+    try:
+        errors = np.stack(errors_aligned, axis=0)  # [N, T, 3]
+    except ValueError:
+        # 如果stack失败，尝试array
+        errors = np.array(errors_aligned)  # [N, T, 3]
+        # 如果还是4D，需要squeeze
+        if errors.ndim == 4:
+            errors = errors.squeeze(axis=1)  # 移除多余的维度
+        elif errors.ndim == 2:
+            errors = errors[np.newaxis, ...]  # 添加batch维度
+    
+    print(f"Errors数组形状: {errors.shape}")  # 调试信息
+    
+    # 最终验证
+    if errors.ndim != 3:
+        raise ValueError(f"Expected errors to be 3D array [N, T, 3], got shape {errors.shape}. "
+                         f"Please check the error calculation logic.")
+    if errors.shape[2] != 3:
+        raise ValueError(f"Expected errors last dimension to be 3, got {errors.shape[2]}")
+    
+    N, T, C = errors.shape
+    print(f"Errors数组: {N}个样本, {T}个时间步, {C}个变量")
+    print(f"Errors数组形状详细: {errors.shape}")
+    
+    # 检查是否有异常的时间步数
+    if T == 1:
+        print("警告: 时间步数只有1，这可能不正确。检查解码结果...")
+        # 打印前几个样本的实际误差长度
+        for i in range(min(5, len(errors_aligned))):
+            print(f"  样本{i}的误差数组形状: {errors_aligned[i].shape}")
+    
+    errors[..., -1] = errors[..., -1] * (180 / np.pi)
+    
+    # 2. 统计分析
+    # axis=0 表示在样本维度上计算统计量，结果应该是 [T, 3]
+    if N == 1:
+        # 如果只有一个样本，percentile会返回标量，需要特殊处理
+        p95_errors = errors[0]  # [T, 3]
+        p99_errors = errors[0]  # [T, 3]
+        max_errors = errors[0]  # [T, 3]
+        print("警告: 只有一个样本，无法计算分位数，使用样本本身")
+    else:
+        p95_errors = np.percentile(errors, 95, axis=0) # 95分位误差 (排除极端离群点) -> [T, 3]
+        p99_errors = np.percentile(errors, 99, axis=0) # 99分位误差 (也就是几乎最差的情况) -> [T, 3]
+        max_errors = np.max(errors, axis=0)         # 最大误差 -> [T, 3]
+    
+    print(f"max_errors形状: {max_errors.shape}, p99_errors形状: {p99_errors.shape}")  # 调试信息
+    print(f"max_errors内容预览 (前3个时间步): {max_errors[:min(3, T)]}")  # 调试信息
+    
+    # 确保统计结果形状正确
+    if max_errors.ndim != 2 or max_errors.shape[1] != 3:
+        raise ValueError(f"Expected max_errors to be [T, 3], got shape {max_errors.shape}")
+    if p99_errors.ndim != 2 or p99_errors.shape[1] != 3:
+        raise ValueError(f"Expected p99_errors to be [T, 3], got shape {p99_errors.shape}")
+    
+    var_names = ['dx', 'dy', 'dyaw']
+    T = max_errors.shape[0]  # 实际时间步数
+    
+    # 3. 找出误差最大的时间步
+    print("\n" + "="*50)
+    print("【关键结论：误差最大的位置】")
+    print("="*50)
+    
+    if T == 0:
+        print("警告: 没有时间步数据")
+        return max_errors, p99_errors, var_names
+    
+    for i, var in enumerate(var_names):
+        if T == 1:
+            worst_step_max = 0
+            worst_step_p99 = 0
+        else:
+            worst_step_max = int(np.argmax(max_errors[:, i]))
+            worst_step_p99 = int(np.argmax(p99_errors[:, i]))
+        
+        max_val_absolute = max_errors[worst_step_max, i]
+        max_val_p99 = p99_errors[worst_step_p99, i]
+        
+        print(f"变量 {var}:")
+        # 使用 .item() 避免 numpy 格式化报错
+        print(f"  - [最差情况] 最大误差出现在第 [ {worst_step_max} ] 帧, 误差值: {max_val_absolute.item():.6f}")
+        print(f"  - [P99 情况] P99误差出现在第 [ {worst_step_p99} ] 帧, 误差值: {max_val_p99.item():.6f}")
+    
+    # 找到 dx 误差最大的那个样本的 index
+    worst_case_dict = find_worst_samples(errors)
+
+    # 4. 生成详细的 DataFrame 报表
+    # 为了方便查看，我们把每一步的数据打印出来
+    # 这里以 Mean 和 P99 为主
+    T = max_errors.shape[0]  # 使用实际的时间步数
+    report_data = []
+    for t in range(T):
+        row = {'TimeStep': t}
+        for i, var in enumerate(var_names):
+            row[f'{var}'] = max_errors[t, i]
+            row[f'{var}_p99'] = p99_errors[t, i]
+        report_data.append(row)
+        
+    df = pd.DataFrame(report_data)
+    print("\n" + "="*50)
+    
+    # 根据时间步数动态调整打印数量
+    print(f"【详细数据表 (全部{T}帧)】")
+    print("="*50)
+    print(df)
+
+    # 5. 可视化绘图
+    plot_errors(max_errors, p99_errors, var_names, time_horizon=T)
+    
+    return max_errors, p99_errors, var_names
+
+def plot_errors(max_errors, p99_errors, var_names, time_horizon=None):
+    """
+    绘制误差随时间步变化的曲线
+    
+    Args:
+        max_errors: [T, 3] 最大误差
+        p99_errors: [T, 3] P99误差
+        var_names: 变量名称列表
+        time_horizon: 时间步数，如果为None则从max_errors的形状推断
+    """
+    if time_horizon is None:
+        time_horizon = max_errors.shape[0]
+    time_steps = np.arange(time_horizon)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    for i, ax in enumerate(axes):
+        # 绘制平均误差
+        ax.plot(time_steps, max_errors[:, i], 'b-o', label='max Error', linewidth=2)
+        # 绘制99分位误差（虚线）
+        ax.plot(time_steps, p99_errors[:, i], 'r--', label='P99 Error', linewidth=1.5)
+        
+        ax.set_title(f'{var_names[i]} Reconstruction Error')
+        ax.set_xlabel('Time Step (Frame)')
+        ax.set_ylabel('Absolute Error')
+        ax.grid(True, linestyle='--', alpha=0.6)
+        ax.legend()
+        
+        # 标出最大值点
+        max_idx = np.argmax(max_errors[:, i])
+        max_val = max_errors[max_idx, i]
+        ax.annotate(f'Max: {max_val:.4f}', 
+                    xy=(max_idx, max_val), 
+                    xytext=(max_idx, max_val*1.1),
+                    arrowprops=dict(facecolor='black', shrink=0.05))
+
+    plt.tight_layout()
+    # plt.show()
+    plt.savefig('./work_dirs/pca_errors.png')
+
+
+def plot_token_bin_distribution(dataset, tokenizer, num_components=15, save_path='./work_dirs/token_bin_distribution.png'):
+    """
+    统计并绘制每个token位置的bin分布柱状图
+    
+    Args:
+        dataset: 轨迹数据，形状为 [N, 25, 3]
+        tokenizer: PCATokenizer 实例
+        num_components: token数量，默认15
+        save_path: 保存路径
+    """
+    print(f"开始统计token bin分布，样本数: {len(dataset)}，token数: {num_components}...")
+    
+    # 1. 对所有样本进行编码，收集所有token
+    all_tokens = []
+    for sample in tqdm(dataset, desc="Encoding samples"):
+        sample = np.array(sample)
+        tokens = tokenizer(sample, num_components=num_components)
+        all_tokens.append(tokens)
+    
+    # 转换为numpy数组: [N, num_components]
+    all_tokens = np.array(all_tokens)
+    print(f"Token数组形状: {all_tokens.shape}")
+    
+    # 2. 获取vocab_size
+    vocab_size = tokenizer.vocab_size
+    print(f"Vocab size: {vocab_size}")
+    
+    # 3. 统计每个token位置的bin分布
+    # 创建子图：3行5列，共15个token位置
+    n_rows = 3
+    n_cols = 5
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 12))
+    fig.suptitle(f'Token Bin Distribution (Total samples: {len(dataset)}, Vocab size: {vocab_size})', 
+                 fontsize=16, fontweight='bold')
+    
+    for token_idx in range(num_components):
+        row = token_idx // n_cols
+        col = token_idx % n_cols
+        ax = axes[row, col]
+        
+        # 获取当前token位置的所有bin值
+        token_bins = all_tokens[:, token_idx]
+        
+        # 统计每个bin的频次
+        bins, counts = np.unique(token_bins, return_counts=True)
+        
+        # 创建完整的bin范围（0到vocab_size-1），缺失的bin填充0
+        full_bins = np.arange(vocab_size)
+        full_counts = np.zeros(vocab_size, dtype=np.int32)
+        for b, c in zip(bins, counts):
+            full_counts[b] = c
+        
+        # 绘制柱状图
+        ax.bar(full_bins, full_counts, alpha=0.7, color='steelblue', edgecolor='black', linewidth=0.5)
+        ax.set_title(f'Token {token_idx}\n(Used bins: {len(bins)}/{vocab_size})', fontsize=10)
+        ax.set_xlabel('Bin ID', fontsize=9)
+        ax.set_ylabel('Count', fontsize=9)
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # 添加统计信息
+        max_bin = bins[np.argmax(counts)]
+        max_count = np.max(counts)
+        ax.text(0.02, 0.98, f'Max: bin={max_bin}, count={max_count}\nTotal: {len(dataset)}', 
+                transform=ax.transAxes, fontsize=8,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # 如果vocab_size太大，只显示有值的范围
+        if vocab_size > 100:
+            # 找到有值的范围
+            used_range = np.where(full_counts > 0)[0]
+            if len(used_range) > 0:
+                min_bin = max(0, used_range[0] - 10)
+                max_bin_show = min(vocab_size - 1, used_range[-1] + 10)
+                ax.set_xlim(min_bin, max_bin_show)
+    
+    plt.tight_layout()
+    
+    # 确保保存目录存在
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"\nToken bin分布图已保存至: {save_path}")
+    
+    # 4. 打印统计摘要
+    print("\n" + "="*60)
+    print("Token Bin分布统计摘要")
+    print("="*60)
+    for token_idx in range(num_components):
+        token_bins = all_tokens[:, token_idx]
+        unique_bins = np.unique(token_bins)
+        bin_range = f"[{np.min(token_bins)}, {np.max(token_bins)}]"
+        used_ratio = len(unique_bins) / vocab_size * 100
+        print(f"Token {token_idx:2d}: 使用bin数 {len(unique_bins):4d}/{vocab_size:4d} ({used_ratio:5.2f}%), "
+              f"范围 {bin_range}, 最频繁bin: {np.argmax(np.bincount(token_bins))}")
+
+
+if __name__ == "__main__":
+    # # 数据路径配置
+    # data_path = '/data-algorithm-hl/zhe.du/planner/plannn2/data_v3/tokenizer/dxdydyaw_pca_20token_1209/all_datas.npy'
+    # json_path = '/data-algorithm-hl/zhe.du/planner/plannn2/data_v3/tokenizer/dxdydyaw_pca_20token_1209/dxdydyaw_pca_tokenizer.json'
+    
+    # # 加载数据
+    # print("加载数据...")
+    # data_info = np.load(data_path, allow_pickle=True).item()
+    # datas = data_info['trajs']
+    # mean_val = data_info['mean_val']
+    # std_val = data_info['std_val']
+    # print(f"数据形状: {datas.shape}")
+    
+    # # 加载tokenizer
+    # print("加载tokenizer...")
+    # tokenizer = PCATokenizer(json_path)
+    
+    # # 统计并绘制token bin分布
+    # save_path = './work_dirs/token_bin_distribution_15tokens.png'
+    # plot_token_bin_distribution(datas, tokenizer, num_components=15, save_path=save_path)
+
+
+    # 数据路径配置
+    data_path = '/data-algorithm-hl/zhe.du/planner/plannn2/data_v3/tokenizer/dxdydyaw_pca_20token_1209/all_datas.npy'
+    # json_path = '/data-algorithm-hl/zhe.du/planner/plannn2/data_v3/tokenizer/dxdydyaw_pca_20token_1209/dxdydyaw_pca_tokenizer.json'
+    json_path = '/data-algorithm-hl/zhe.du/planner/plannn2/data_v3/tokenizer/pca_toneizer_dxdydyaw_ego_15frame_1215/dxdydyaw_pca_tokenizer.json'
+
+    
+    # 加载数据
+    print("加载数据...")
+    data_info = np.load(data_path, allow_pickle=True).item()
+    datas = data_info['trajs'][:, :14]
+    mean_val = data_info['mean_val']
+    std_val = data_info['std_val']
+    print(f"数据形状: {datas.shape}")
+    
+    # 加载tokenizer
+    print("加载tokenizer...")
+    tokenizer = PCATokenizer(json_path)
+    
+    # 统计并绘制token bin分布
+    save_path = './work_dirs/token_bin_distribution_15tokens.png'
+    plot_token_bin_distribution(datas, tokenizer, num_components=7, save_path=save_path)
+
+    # 统计每个系数对应的误差
+    print("\n开始统计每个主成分系数的重建误差...")
+    # 这里假设evaluate_pca_reconstruction和plot_errors已经定义
+    max_errors, p99_errors, var_names = evaluate_pca_reconstruction(datas, tokenizer, num_components=7)
+    plot_errors(max_errors, p99_errors, var_names)
+
+    

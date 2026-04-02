@@ -1,0 +1,205 @@
+import numpy as np
+import time
+import os
+import sys
+
+
+def sample_trajectorys_granular_dxdydyaw(
+    all_dxdydyaw_clips,
+    n_samples_for_pca=100000,
+    time_duration=None,
+    fps=5.0,
+):
+    """
+    基于 dxdydyaw 的 10分类精细化均衡采样策略
+    
+    分类包括：
+    0. Stationary - 静止
+    1. Straight - 直行
+    2. LaneChange - 变道
+    3. Left_Gentle - 左转缓弯
+    4. Left_Sharp - 左转急弯
+    5. Left_Uturn - 左转掉头
+    6. Right_Gentle - 右转缓弯
+    7. Right_Sharp - 右转急弯
+    8. Right_Uturn - 右转掉头
+    9. HighSpeed - 高速场景（平均速度 >= 70km/h）
+    
+    Args:
+        all_dxdydyaw_clips: [N, 25, 3] (dx, dy, dyaw)
+        n_samples_for_pca: 目标总采样数
+        time_duration: 25帧对应的时间间隔（秒），默认 None 表示按 fps 自动计算 (T / fps)
+        fps: 采样帧率（用于计算 time_duration，当 time_duration 为 None 时生效）
+        
+    Returns:
+        sampled_trajs: [M, 25, 3] 采样后的 dxdydyaw
+        mean_val: 均值
+        std_val: 标准差
+    """
+    # 确保输入是 float 类型
+    if isinstance(all_dxdydyaw_clips, list):
+        all_dxdydyaw_clips = np.array(all_dxdydyaw_clips)
+        
+    N = all_dxdydyaw_clips.shape[0]
+    
+    # 1. 计算统计特征 (基于几何)
+    dxs = all_dxdydyaw_clips[:, :, 0]  # [N, T] 在上一帧ego坐标系下的dx
+    dys = all_dxdydyaw_clips[:, :, 1]  # [N, T] 在上一帧ego坐标系下的dy
+    dyaws = all_dxdydyaw_clips[:, :, 2]  # [N, T] 航向角增量
+    
+    N, T = dxs.shape
+    # 我们使用累积后的yaw来计算全局坐标系下的特征
+    cumulative_yaws = np.cumsum(dyaws, axis=1)  # [N, T] 每帧的绝对yaw（相对于初始帧）
+    # 但dx[t]是在yaw[t-1]坐标系下的，所以需要前一个yaw
+    prev_yaws = np.zeros((N, T), dtype=dxs.dtype)  # [N, T]
+    prev_yaws[:, 1:] = cumulative_yaws[:, :-1]  # 第t帧的dx,dy是在yaw[t-1]坐标系下
+    
+    # [特征1] 净转向角 (rad): 25步之后车头总共偏了多少
+    # 使用累积后的yaw来计算，确保与坐标系定义一致
+    # net_yaw = cumulative_yaws[:, -1]  # 最后一帧的yaw就是净转向角
+    # 或者直接使用dyaw的累加（两者应该相等，但使用累积值更明确）
+    net_yaw = cumulative_yaws[:, -1] if T > 0 else np.zeros(N)  # [N] 最后一帧的绝对yaw
+    
+    # [特征2] 总累计转向 (rad): 方向盘总共动了多少 (用于区分变道和直行)
+    # dyaw是航向角增量，可以直接累加绝对值
+    gross_yaw = np.sum(np.abs(dyaws), axis=1)  # [N]
+    
+    # 将局部坐标系的dx, dy转换到全局坐标系
+    # 转换公式：从局部到全局
+    # x_global = cos(yaw) * x_local - sin(yaw) * y_local
+    # y_global = sin(yaw) * x_local + cos(yaw) * y_local
+    cos_yaws = np.cos(prev_yaws)  # [N, T]
+    sin_yaws = np.sin(prev_yaws)  # [N, T]
+    
+    # 转换到全局坐标系
+    dx_global = cos_yaws * dxs - sin_yaws * dys  # [N, T]
+    dy_global = sin_yaws * dxs + cos_yaws * dys  # [N, T]
+    
+    # 计算每步在全局坐标系下的移动距离
+    step_dists = np.sqrt(dx_global**2 + dy_global**2)  # [N, T]
+    total_dist = np.sum(step_dists, axis=1)  # [N]
+    
+    # [特征4] 平均速度 (m/s): 用于判断高速场景
+    duration = time_duration if time_duration is not None else (T / fps)
+    duration = max(duration, 1e-6)  # 避免除零
+    avg_speed = total_dist / duration  # [N] m/s
+    TH_SPEED_HIGH = 70.0 / 3.6  # 70 km/h 转换为 m/s ≈ 19.44 m/s
+    
+    # 2. 定义阈值 (根据 dxdydyaw 的物理意义调整)
+    # -----------------------------------------------------------
+    # 静止阈值: 25帧(约2.5秒-5秒)内总移动距离小于 1.0 米视为静止
+    TH_DIST_STATIC = 1.0   
+    
+    # 角度阈值 (Rad): 
+    # 0.1 rad ≈ 5.7度 (直行容差)
+    # 0.2 rad ≈ 11.5度 (变道累计转向下限)
+    TH_STRAIGHT = 0.10    
+    TH_LC_GROSS = 0.20    
+    
+    TH_GENTLE = 1.05      # 缓弯上限 (~60度)
+    TH_SHARP = 2.35       # 直角转弯上限 (~135度)
+    
+    # 3. 构建索引掩码
+    # -------------------------------------------------
+    # A. 静止 (Stationary)
+    # 特征：总移动距离很短
+    mask_static = (total_dist < TH_DIST_STATIC)
+    
+    # B. 高速场景 (High Speed)
+    # 特征：平均速度大于70km/h
+    mask_high_speed = (avg_speed >= TH_SPEED_HIGH)
+    
+    # 下面的分类排除静止车辆
+    not_static = ~mask_static
+    
+    # B. 变道 (Lane Change)
+    # 特征：车头最终回正了(Net小)，但过程有转向(Gross大)
+    mask_lc = (np.abs(net_yaw) < TH_STRAIGHT) & (gross_yaw >= TH_LC_GROSS) & not_static
+    
+    # C. 直行 (Straight)
+    # 特征：车头没转，过程也没动
+    mask_straight = (np.abs(net_yaw) < TH_STRAIGHT) & (gross_yaw < TH_LC_GROSS) & not_static
+    
+    # D. 左转系列 (Net Yaw > TH_STRAIGHT)
+    mask_left_gentle = (net_yaw >= TH_STRAIGHT) & (net_yaw < TH_GENTLE) & not_static
+    mask_left_sharp  = (net_yaw >= TH_GENTLE) & (net_yaw < TH_SHARP) & not_static
+    mask_left_uturn  = (net_yaw >= TH_SHARP) & not_static
+    
+    # E. 右转系列 (Net Yaw < -TH_STRAIGHT)
+    mask_right_gentle = (net_yaw <= -TH_STRAIGHT) & (net_yaw > -TH_GENTLE) & not_static
+    mask_right_sharp  = (net_yaw <= -TH_GENTLE) & (net_yaw > -TH_SHARP) & not_static
+    mask_right_uturn  = (net_yaw <= -TH_SHARP) & not_static
+    
+    # 4. 组装类别字典
+    categories = {
+        "0_Stationary": mask_static,
+        "1_Straight": mask_straight,
+        "2_LaneChange": mask_lc,
+        "3_Left_Gentle": mask_left_gentle,
+        "4_Left_Sharp": mask_left_sharp,
+        "5_Left_Uturn": mask_left_uturn,
+        "6_Right_Gentle": mask_right_gentle,
+        "7_Right_Sharp": mask_right_sharp,
+        "8_Right_Uturn": mask_right_uturn,
+        "9_HighSpeed": mask_high_speed
+    }
+    
+    # 5. 执行均衡采样
+    active_categories = [k for k, v in categories.items() if np.sum(v) > 0]
+    if len(active_categories) == 0:
+        print("警告：没有检测到任何有效分类数据！")
+        return all_dxdydyaw_clips, None, None, None
+        
+    n_per_class = n_samples_for_pca // len(active_categories)
+    
+    all_sampled_indices = []
+    
+    print(f"\n{'类别名称':<20} | {'原始数量':<10} | {'占比':<8} | {'采样动作'}")
+    print("-" * 65)
+    
+    for name, mask in categories.items():
+        indices = np.where(mask)[0]
+        count = len(indices)
+        
+        if count == 0:
+            continue
+            
+        ratio = count / N * 100
+        
+        if count >= n_per_class:
+            # 降采样
+            action = "Undersample"
+            selected = np.random.choice(indices, n_per_class, replace=False)
+        else:
+            # 过采样
+            action = f"Oversample (x{n_per_class/count:.1f})"
+            selected = np.random.choice(indices, n_per_class, replace=True)
+            
+        all_sampled_indices.append(selected)
+        print(f"{name:<20} | {count:<10} | {ratio:>6.2f}% | {action}")
+        
+    all_sampled_indices = np.concatenate(all_sampled_indices)
+    np.random.shuffle(all_sampled_indices)
+    
+    # 6. 提取结果 & 转换 Polygons
+    # -------------------------------------------------
+    print("-" * 65)
+    print(f"原始总量: {N}")
+    print(f"采样后总量: {len(all_sampled_indices)} (生成 polygons 中...)")
+    
+    # 提取 dxdydyaw
+    sampled_trajectories = all_dxdydyaw_clips[all_sampled_indices]
+    
+    # 7. 计算归一化统计量 (Mean/Std)
+    mean_val = np.mean(sampled_trajectories, axis=(0, 1), keepdims=True)
+    std_val = np.std(sampled_trajectories, axis=(0, 1), keepdims=True) + 1e-8
+    
+    return sampled_trajectories, mean_val, std_val
+
+
+if __name__ == '__main__':
+    datas = np.load('/home/zhe.du/code/planner/nio_planner/v3/dct_acc/work_dirs/dxdydyaw/all_datas.npy', allow_pickle=True).item()
+    datas = datas['trajs']
+    print('all_datas:', datas.shape)
+    
+    all_label_clips_sampled, mean_val_sampled, std_val_sampled = sample_trajectorys_granular_dxdydyaw(datas, n_samples_for_pca=100000, fps=5.0)

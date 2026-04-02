@@ -1,0 +1,1046 @@
+import os
+import numpy as np
+import torch
+import json
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+
+def get_vel_acc_kappa(xyyaw, dt=0.2):
+    B, T, _ = xyyaw.shape
+    x  = xyyaw[:, :, 0]
+    y  = xyyaw[:, :, 1]
+    yaw = xyyaw[:, :, 2]
+
+    # 1) 速度  (B, T)
+    dx = np.gradient(x, dt, axis=1)
+    dy = np.gradient(y, dt, axis=1)
+    v = dx * np.cos(yaw) + dy * np.sin(yaw)   # 投影到车体朝向
+
+    # 2) 加速度
+    a = np.gradient(v, dt, axis=1)
+
+    # 3) jerk
+    jerk = np.gradient(a, dt, axis=1)
+
+    # 4) 曲率 κ
+    ds = np.abs(v) * dt
+    ds[ds == 0] = np.inf
+    dyaw = np.gradient(yaw, dt, axis=1)
+    kappa = dyaw / ds
+    kappa[np.isinf(kappa)] = 0.0
+
+    # 5) K 就是 κ
+    K = kappa.copy()
+
+    return v, a, jerk, K
+
+def get_xyyaw_from_polygon_torch(corners):
+    """
+    corners: n x 4 x 2
+    return: n x 7
+    """
+    xy = corners.mean(dim=1)  # n x 2
+    x = xy[:, 0]
+    y = xy[:, 1]
+    z = torch.zeros_like(x)
+    pxpy = corners[:, 1:3].mean(dim=1)  # n x 2
+    px = pxpy[:, 0]
+    py = pxpy[:, 1]
+    yaw = torch.atan2(py - y, px - x)  # n
+    l = torch.norm(corners[:, 0] - corners[:, 1], dim=1)  # n
+    w = torch.norm(corners[:, 1] - corners[:, 2], dim=1)  # n
+    h = torch.zeros_like(l) + 2
+    return torch.stack([x, y, yaw], dim=1)  # n x 7
+
+def transform_polygon_torch_5s(init_polygons, actions, state_range=1.0):
+    """
+    Args:
+        init_polygons: [B, 4, 2]  初始多边形位置
+        actions:       [B, T, 3]  动作序列 (dx, dy, dyaw)
+        state_range:   float, 坐标归一化尺度
+    Returns:
+        polygons: [B, T, 4, 2] 未来 T 帧多边形
+    """
+    B, _, _ = init_polygons.shape
+    T = actions.shape[1]
+
+    # ---- STEP 1: decode actions ----
+    dx, dy, dyaw = actions[..., 0], actions[..., 1], actions[..., 2]  # [B, T]
+
+    # ---- STEP 2: 初始化输出 ----
+    polygons = torch.zeros(B, T, 4, 2, device=init_polygons.device, dtype=init_polygons.dtype)
+
+    half_l = torch.norm(init_polygons[:, 1] - init_polygons[:, 0], dim=1) / 2
+    half_w = torch.norm(init_polygons[:, 1] - init_polygons[:, 2], dim=1) / 2
+
+    corners = torch.stack(
+        [
+            torch.stack([-half_l, -half_w], dim=1),
+            torch.stack([ half_l, -half_w], dim=1),
+            torch.stack([ half_l,  half_w], dim=1),
+            torch.stack([-half_l,  half_w], dim=1),
+        ],
+        dim=1,
+    )  # [B, 4, 2]
+
+    # prev_poly 表示上一帧多边形（初始是 init_polygons）
+    prev_poly = init_polygons
+
+    # ---- STEP 3: 计算每一步 polygon ----
+    for t in range(T):
+        # 计算前一帧的旋转矩阵（多边形自身方向）
+        direct = prev_poly[ :, 1] - prev_poly[:, 0]   # [B, 2]
+        yaw_prev = torch.atan2(direct[:, 1], direct[:, 0])
+        sin_p = torch.sin(yaw_prev)
+        cos_p = torch.cos(yaw_prev)
+
+        # polygon 内部旋转+平移矩阵
+        pose = torch.eye(3, device=init_polygons.device, dtype=init_polygons.dtype).unsqueeze(0).repeat(B, 1, 1)
+        pose[:, 0, 0] = cos_p
+        pose[:, 0, 1] = -sin_p
+        pose[:, 1, 0] = sin_p
+        pose[:, 1, 1] = cos_p
+        pose[:, 0, 2] = prev_poly.mean(dim=1)[:, 0]
+        pose[:, 1, 2] = prev_poly.mean(dim=1)[:, 1]
+
+        # 动作变换矩阵
+        TR = torch.eye(3, device=init_polygons.device, dtype=init_polygons.dtype).unsqueeze(0).repeat(B, 1, 1)
+        sin_a = torch.sin(dyaw[:, t])
+        cos_a = torch.cos(dyaw[:, t])
+        TR[:, 0, 0] = cos_a
+        TR[:, 0, 1] = -sin_a
+        TR[:, 1, 0] = sin_a
+        TR[:, 1, 1] = cos_a
+        TR[:, 0, 2] = dx[:, t] / state_range
+        TR[:, 1, 2] = dy[:, t] / state_range
+
+        # ---- STEP 4: 变换并生成下一帧 ----
+        final_pose = torch.matmul(pose, TR)  # [B, 3, 3]
+        R = final_pose[:, :2, :2]
+        t_trans = final_pose[:, :2, 2].unsqueeze(1)
+        new_poly = corners @ R.transpose(-1, -2) + t_trans  # [B, 4, 2]
+
+        # 写入输出
+        polygons[:, t] = new_poly
+
+        # 更新 prev_poly 给下一轮
+        prev_poly = new_poly
+
+    return polygons  # [B, T, 4, 2]
+
+class PCATokenizer:
+    def __init__(self, config_path=None):
+        """
+        初始化 Tokenizer。
+        如果提供了 config_path (json文件路径)，则自动加载模型。
+        """
+        self.params = {}
+        self.is_fitted = False
+        self.vocab_size = None
+
+        if config_path:
+            self.load_model(config_path)
+
+    def fit(self, data, mean_val, std_val, save_json_path=None, n_components=20, n_bins=1024, scales=(1.0, 1.0, 1.0)):
+        """
+        训练 PCA 和量化参数。
+
+        Args:
+            data: [N, 25, 3] 的 dxdydyaw 数据 (numpy array)
+            mean_val: [1, 1, 3] 均值
+            std_val:  [1, 1, 3] 标准差
+            save_json_path: 保存配置的 json 路径
+            n_components: 保留的主成分数量
+            n_bins: 量化桶数量
+            scales: (dx_scale, dy_scale, dyaw_scale) 人工设定的缩放因子
+        """
+        print(f"开始训练 PCATokenizer... 数据形状: {data.shape}")
+
+        # 1. 维度检查
+        if data.shape[-1] != 3:
+            raise ValueError(f"输入数据最后一维应该是 3 (dx, dy, dyaw)，实际是 {data.shape[-1]}")
+
+        # 2. 标准化 (Z-Score)
+        data_norm = (data - mean_val) / (std_val + 1e-8)
+
+        # 3. 物理缩放 [1, 1, 3]
+        scale_arr = np.array(scales).reshape(1, 1, 3)
+        data_scaled = data_norm * scale_arr
+
+        print("\n缩放后数据统计:")
+        print(f"DX   列 - Min: {np.min(data_scaled[..., 0]):.4f}, Max: {np.max(data_scaled[..., 0]):.4f}")
+        print(f"DY   列 - Min: {np.min(data_scaled[..., 1]):.4f}, Max: {np.max(data_scaled[..., 1]):.4f}")
+        print(f"DYaw 列 - Min: {np.min(data_scaled[..., 2]):.4f}, Max: {np.max(data_scaled[..., 2]):.4f}")
+
+        # 4. 展平 (Flatten) -> [N, 25*3=75]
+        N, T, C = data.shape
+        data_flat = data_scaled.reshape(N, -1)
+
+        # 5. PCA 拟合
+        pca = PCA(n_components=n_components)
+        pca.fit(data_flat)
+
+        # 获取 PCA 系数 [N, n_components] 用以计算量化边界
+        latent_codes = pca.transform(data_flat)
+
+        # 6. 计算量化边界 (Percentile Clipping)
+        q_min = np.quantile(latent_codes, 0.001, axis=0) # 0.1%
+        q_max = np.quantile(latent_codes, 0.999, axis=0) # 99.9%
+        q_max = np.maximum(q_max, q_min + 1e-6) # 防止除零
+
+        # 7. 保存参数到内存
+        self.params = {
+            # 基础统计量
+            'data_mean': mean_val,
+            'data_std': std_val,
+            'scales': scale_arr,
+            'original_shape': [T, C], # [25, 3]
+
+            # PCA 核心参数
+            'pca_components': pca.components_, # [n_components, 75] -> npy
+            'pca_mean': pca.mean_,             # [75] -> json
+
+            # 量化参数
+            'q_min': q_min,
+            'q_max': q_max,
+            'n_bins': n_bins,
+            'n_components': n_components
+        }
+
+        self.is_fitted = True
+        self.vocab_size = n_bins
+        print(f"训练完成。保留主成分: {n_components}, 解释方差比: {np.sum(pca.explained_variance_ratio_):.4f}")
+
+        if save_json_path:
+            self.save_model(save_json_path)
+
+    def __call__(self, trajectory, num_components=None):
+        """Encode: [..., 25, 3] -> [..., n_components] (Token IDs)"""
+        if not self.is_fitted: raise RuntimeError("Tokenizer 未训练")
+
+        x = np.array(trajectory)
+        input_shape = x.shape
+        # if input_shape[-2:] != (25, 3) or input_shape[-2:] != (14, 3):
+            # raise ValueError(f"输入维度错误，期望 [..., 25, 3]，实际 {input_shape}")
+
+        target_k = num_components if num_components is not None else self.params['n_components']
+
+        # 1. 预处理
+        x_norm = (x - self.params['data_mean']) / (self.params['data_std'] + 1e-8)
+        x_scaled = x_norm * self.params['scales']
+        x_flat = x_scaled.reshape(*input_shape[:-2], -1)
+
+        # 2. PCA 投影 (纯 Numpy 实现)
+        # (X - mu) @ V.T
+        x_centered = x_flat - self.params['pca_mean']
+        latent = np.dot(x_centered, self.params['pca_components'][:target_k].T)
+
+        # 3. 量化
+        return self._quantize(latent, num_components=target_k)
+
+    def decode(self, token_ids, num_components=None):
+        """Decode: [..., n_components] (Token IDs) -> [..., 25, 3]"""
+        if not self.is_fitted: raise RuntimeError("Tokenizer 未训练")
+
+        token_ids = np.array(token_ids)
+        target_k = num_components if num_components is not None else token_ids.shape[-1]
+
+        # 截断输入以匹配 target_k
+        token_ids = token_ids[..., :target_k]
+
+        # 1. 反量化
+        latent = self._dequantize(token_ids, num_components=target_k)
+
+        # 2. PCA 重构
+        # Z @ V + mu
+        # import pdb; pdb.set_trace()
+        x_recon_flat = np.dot(latent, self.params['pca_components'][:target_k]) + self.params['pca_mean']
+
+        # 3. 后处理
+        current_batch_dims = list(token_ids.shape[:-1])
+        ori_shape_dims = list(self.params['original_shape']) # [25, 3]
+        target_shape = current_batch_dims + ori_shape_dims
+
+        x_recon_scaled = x_recon_flat.reshape(target_shape)
+
+        x_recon_norm = x_recon_scaled / self.params['scales']
+        x_recon = x_recon_norm * (self.params['data_std'] + 1e-8) + self.params['data_mean']
+
+        return x_recon
+
+    def _quantize(self, latent_codes, num_components):
+        q_min = self.q_min
+        q_max = self.q_max
+        n_bins = self.vocab_size
+
+        codes_clipped = np.clip(latent_codes, q_min, q_max)
+        codes_norm = (codes_clipped - q_min) / (q_max - q_min)
+        ids = np.round(codes_norm * (n_bins - 1)).astype(np.int32)
+        return np.clip(ids, 0, n_bins - 1)
+
+    def _dequantize(self, ids, num_components):
+        q_min = self.q_min
+        q_max = self.q_max
+        n_bins = self.vocab_size
+
+        ids = ids.astype(np.float32)
+        codes_norm = ids / (n_bins - 1)
+        return codes_norm * (q_max - q_min) + q_min
+
+    def save_model(self, json_path):
+        """
+        保存模型：
+        1. pca_components 保存为同名 _basis.npy
+        2. 其他参数保存为 .json
+        """
+        if not self.is_fitted: raise RuntimeError("模型未训练，无法保存")
+
+        # 1. 准备路径
+        base_name = os.path.splitext(json_path)[0]
+        npy_path = base_name + "_basis.npy"
+
+        # 2. 保存大矩阵到 npy
+        np.save(npy_path, self.params['pca_components'])
+        print(f"PCA基矩阵已保存至: {npy_path}")
+
+        # 3. 准备 JSON 数据 (numpy -> list)
+        json_dict = {}
+        for k, v in self.params.items():
+            if k == 'pca_components':
+                continue # 已经在 npy 里了
+
+            if isinstance(v, np.ndarray):
+                json_dict[k] = v.tolist()
+            else:
+                json_dict[k] = v
+
+        json_dict['basis_file'] = os.path.basename(npy_path)
+
+        with open(json_path, 'w') as f:
+            json.dump(json_dict, f, indent=4)
+        print(f"Token配置已保存至: {json_path}")
+
+    def load_model(self, json_path):
+        """
+        加载模型
+        """
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"找不到配置文件: {json_path}")
+
+        # 1. 加载 JSON
+        with open(json_path, 'r') as f:
+            json_dict = json.load(f)
+
+        self.params = {}
+        basis_filename = json_dict.pop('basis_file', None)
+
+        # 2. 还原参数
+        for k, v in json_dict.items():
+            if k == 'original_shape':
+                self.params[k] = list(v)
+            elif isinstance(v, list):
+                self.params[k] = np.array(v)
+            else:
+                self.params[k] = v
+
+        # 3. 加载 NPY 基矩阵
+        if basis_filename:
+            npy_path = os.path.join(os.path.dirname(json_path), basis_filename)
+            if not os.path.exists(npy_path):
+                raise FileNotFoundError(f"配置文件引用了 {basis_filename}，但在 {npy_path} 未找到")
+
+            self.params['pca_components'] = np.load(npy_path)
+        else:
+            raise ValueError("JSON 文件中缺少 'basis_file' 字段，无法加载 PCA 基")
+
+        self.is_fitted = True
+        self.vocab_size = self.params['n_bins']
+        self.time_horizon = self.params['original_shape'][0]
+        self.action_dim = self.params['original_shape'][1]
+        self.q_min = min(self.params['q_min'])
+        self.q_max = max(self.params['q_max'])
+        print(f'vocab_size={self.vocab_size}, q_min={self.q_min}, q_max={self.q_max}')
+
+
+
+# ============================================================
+# 0) token 有效范围（用于 sweep bins）
+# ============================================================
+TOKEN_MIN = [0, 274, 120, 282, 312, 323, 367, 395, 420, 415, 394, 426, 431, 420, 431]
+TOKEN_MAX = [1023, 1023, 799, 683, 622, 611, 561, 532, 507, 521, 510, 514, 500, 507, 493]
+TOKEN_MODE = [466, 329, 461, 463, 457, 460, 463, 459, 465, 464, 462, 462, 462, 462, 462]  # 可选：不强制用
+# ============================================================
+# 手动指定的坐标轴“档位”（单位：米，表示坐标轴总跨度 span）
+# 例如 span=40 表示 x/y 范围大约是 [cx-20, cx+20]
+# ============================================================
+AXIS_SPAN_TIERS = [20, 40, 80, 160, 320]   # <- 你自己改这几个档位就行
+AXIS_MARGIN = 2.0                          # <- 给包络框额外留白（米）
+
+# ============================================================
+# 1) 轨迹几何工具：heading/横向偏移/简单指标
+# ============================================================
+def unwrap_angle(theta_1d: np.ndarray) -> np.ndarray:
+    return np.unwrap(theta_1d)
+
+def compute_heading(traj_xy: np.ndarray) -> np.ndarray:
+    """
+    traj_xy: [T,2] (单位：米)
+    return yaw: [T] 由轨迹切向估计的航向（用于可视化指标）
+    """
+    d = np.diff(traj_xy, axis=0, prepend=traj_xy[:1])
+    yaw = np.arctan2(d[:, 1], d[:, 0] + 1e-12)
+    return unwrap_angle(yaw)
+
+def frenet_lat_offset(traj_xy: np.ndarray) -> np.ndarray:
+    """
+    用初始航向定义横向轴，返回每个点的横向位移 lat: [T]
+    """
+    p0 = traj_xy[0]
+    yaw0 = compute_heading(traj_xy)[0]
+    e_lat = np.array([-np.sin(yaw0), np.cos(yaw0)], dtype=np.float64)
+    dp = traj_xy - p0
+    lat = dp @ e_lat
+    return lat
+
+def simple_metrics(traj_xy: np.ndarray) -> dict:
+    """
+    给一个中心轨迹 [T,2]，输出一些直观指标（用于图例/CSV）
+    注意：delta_yaw 用轨迹切向估计，可能受 unwrap 影响；严格转角建议用动作 dyaw 累加。
+    """
+    yaw = compute_heading(traj_xy)
+    lat = frenet_lat_offset(traj_xy)
+    return {
+        "end_x": float(traj_xy[-1, 0]),
+        "end_y": float(traj_xy[-1, 1]),
+        "delta_yaw": float(yaw[-1] - yaw[0]),
+        "lat_abs_max": float(np.max(np.abs(lat))),
+    }
+
+
+# ============================================================
+# 2) token -> 轨迹（中心点）解码：与你原版一致
+# ============================================================
+@torch.no_grad()
+def decode_tokens_to_center_traj(
+    tokenizer,
+    token_batch: np.ndarray,          # [B,K] int
+    init_polygons: torch.Tensor,      # [1,4,2] normalized
+    state_range: float,
+    num_components: int,
+    device: str = "cuda:0",
+) -> np.ndarray:
+    """
+    返回 center trajectories: [B,T,2] in meters
+    """
+    actions_np = tokenizer.decode(token_batch, num_components=num_components).astype(np.float32)  # [B,T,3]
+    actions = torch.from_numpy(actions_np).to(device)
+    # import pdb; pdb.set_trace()
+    vx_act = actions[..., 0]
+    vy_act = actions[..., 1]
+    # 带符号v（没乘5，单位不是m/s）
+    v = torch.sqrt(vx_act**2 + vy_act**2) * torch.sign(vx_act)
+
+    B = actions.shape[0]
+    init_poly_batch = init_polygons.to(device).repeat(B, 1, 1)
+
+    polys = transform_polygon_torch_5s(init_poly_batch, actions, state_range=state_range) * state_range
+    B, T, _, _ = polys.shape
+    xyyaw =  get_xyyaw_from_polygon_torch(polys.reshape(B*T, 4, 2)).reshape(B, T, 3)
+
+    return xyyaw.detach().cpu().numpy()
+
+
+# ============================================================
+# 3) sweep bins：按有效范围生成 + 强制包含 base_bin
+# ============================================================
+def choose_sweep_bins_in_valid_range(
+    base_bin: int,
+    k: int,
+    n_points: int = 8,
+) -> list:
+    """
+    使用你提供的 TOKEN_MIN/MAX 作为有效范围，均匀取 n_points 个点，
+    并确保 base_bin 在 bins 里。
+    """
+    lo = int(TOKEN_MIN[k])
+    hi = int(TOKEN_MAX[k])
+    lo2 = 0
+    hi2 = 1023
+
+    cand = np.linspace(lo2, hi2, n_points).round().astype(int).tolist()
+    cand.append(int(base_bin))
+    cand = sorted(set([int(np.clip(x, lo2, hi2)) for x in cand]))
+    return cand
+
+
+# ============================================================
+# 4) 绘图：在原 interventional_sweep_one_dim 上“最小改动”
+#    - 增加 axis_limits 参数，保证所有图 xy 尺度一致
+# ============================================================
+def interventional_sweep_one_dim(
+    tokenizer,
+    base_tokens: np.ndarray,          # [K]
+    sweep_dim: int,
+    sweep_bins: list,
+    init_polygons: torch.Tensor,
+    state_range: float,
+    num_components: int,
+    out_dir: str,
+    device: str = "cuda:0",
+    title_prefix: str = "",
+    axis_limits=None,                 # (xmin, xmax, ymin, ymax)
+    tiers=None,
+    fps: float = 5.0                  # <--- [新增参数] 默认为 5.0
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 1) 组 batch：只改 sweep_dim
+    token_batch = []
+    for b in sweep_bins:
+        t = base_tokens.copy()
+        t[sweep_dim] = int(b)
+        token_batch.append(t)
+    token_batch = np.stack(token_batch, axis=0).astype(np.int32)  # [B,K]
+
+    # 2) 解码得到中心轨迹
+    xyyaw = decode_tokens_to_center_traj(
+        tokenizer, token_batch, init_polygons, state_range, num_components, device=device
+    )  # [B,T,2]
+
+    vel, acc, jeck, kappa = get_vel_acc_kappa(xyyaw, dt=1/fps)
+
+    kappa = np.clip(kappa, -10.0, 10.0)  # 限制曲率范围
+
+    time_axis = np.arange(xyyaw.shape[1]) /fps  # [T] 时间轴
+
+    # ==========================================================
+    # [修改]：改为 2行3列 画板
+    # ==========================================================
+    # figsize 调大以容纳6张图
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+
+    # 分配子图对象
+    ax_traj = axes[0, 0] # 轨迹 (原图)
+    ax_yaw   = axes[0, 1]
+    ax_kappa   = axes[0, 2]
+    ax_vel   = axes[1, 0]
+    ax_acc   = axes[1, 1]
+    ax_jerk   = axes[1, 2]
+
+    base_bin = int(base_tokens[sweep_dim])
+    base_idx = sweep_bins.index(base_bin) if base_bin in sweep_bins else None
+
+    # 用于统计当前这一组 sweep 的实际最大范围 (供你的逻辑使用)
+    cur_xmin, cur_xmax = 1e9, -1e9
+    cur_ymin, cur_ymax = 1e9, -1e9
+
+    for i, b in enumerate(sweep_bins):
+        x = xyyaw[i, :, 0]
+        y = xyyaw[i, :, 1]
+
+        # --- 收集当前数据的范围 ---
+        cur_xmin = min(cur_xmin, np.min(x)); cur_xmax = max(cur_xmax, np.max(x))
+        cur_ymin = min(cur_ymin, np.min(y)); cur_ymax = max(cur_ymax, np.max(y))
+
+        lo = TOKEN_MIN[sweep_dim]
+        hi = TOKEN_MAX[sweep_dim]
+        is_oob = (b < lo) or (b > hi)
+
+        label = f"bin={b}" # 简化一下label，不然6个图图例太挤
+
+        # --- 统一样式 ---
+        if is_oob:
+            kwargs = dict(linestyle="--", linewidth=1.5, color="gray", alpha=0.9, marker='.', markersize=4)
+            zorder = 1
+        else:
+            if base_idx is not None and i == base_idx:
+                kwargs = dict(linewidth=3, marker='o', markersize=5)
+                zorder = 3
+            else:
+                kwargs = dict(linewidth=1, alpha=0.9, marker='.', markersize=4)
+                zorder = 2
+
+        kwargs['label'] = label
+        kwargs['zorder'] = zorder
+
+        # 1. 画轨迹 (ax_traj)
+        line, = ax_traj.plot(x, y, **kwargs)
+
+        # 获取刚才自动分配的颜色 (如果是gray就gray，如果是自动色就取自动色)
+        # 这样后面5个图的颜色能和轨迹对应上
+        if 'color' not in kwargs:
+            c = line.get_color()
+            kwargs['color'] = c
+
+        # 2. 画其他图 (X轴为时间)
+        ax_vel.plot(time_axis, vel[i], **kwargs)
+        ax_acc.plot(time_axis, acc[i], **kwargs)
+        ax_yaw.plot(time_axis, xyyaw[i, :, 2], **kwargs)
+
+        ax_kappa.plot(time_axis, kappa[i], **kwargs)
+        ax_jerk.plot(time_axis, jeck[i], **kwargs)
+
+
+    # ==========================================================
+    # [关键]：恢复你原有的坐标轴逻辑，应用到 ax_traj
+    # ==========================================================
+    ax_traj.set_title(f"{title_prefix}Token {sweep_dim} sweep (base bin={base_bin})")
+    ax_traj.set_xlabel("X")
+    ax_traj.set_ylabel("Y")
+    ax_traj.grid(True)
+
+    # --- 其他子图的简单修饰 ---
+    ax_vel.set_title("vel"); ax_vel.grid(True)
+    ax_acc.set_title("acc"); ax_acc.grid(True)
+    ax_yaw.set_title("yaw"); ax_yaw.grid(True)
+    ax_kappa.set_title("kappa"); ax_kappa.grid(True); # ax_kappa.set_ylim(-1.1, 1.1) # 限制一下曲率范围防止飞出
+    ax_jerk.set_title("jerk"); ax_jerk.grid(True)
+
+    ax_vel.set_xlabel("time/s")
+    ax_acc.set_xlabel("time/s")
+    ax_yaw.set_xlabel("time/s")
+    ax_kappa.set_xlabel("time/s")
+    ax_jerk.set_xlabel("time/s")
+
+    # 只需要在第一个图显示图例，避免拥挤
+    ax_traj.legend(fontsize=6, loc="best")
+
+    plt.tight_layout() # 自动调整间距
+    xy_path = os.path.join(out_dir, f"token_{sweep_dim:02d}_sweep_combined.jpg")
+    plt.savefig(xy_path, dpi=500)
+    plt.close(fig)
+
+    # 5) 保存指标 CSV
+    csv_path = os.path.join(out_dir, f"token_{sweep_dim:02d}_sweep_metrics.csv")
+    # df.to_csv(csv_path, index=False)
+
+    return {"xy_path": xy_path, "csv_path": csv_path, "df": 0}
+
+# ============================================================
+def compute_scene_axis_pool(
+    tokenizer,
+    base_tokens: np.ndarray,          # [K]
+    init_polygons: torch.Tensor,
+    state_range: float,
+    num_components: int,
+    device: str,
+    n_points_bins: int = 20,
+    margin: float = 2.0,
+    quantiles=(0.0, 0.6, 0.85, 0.95, 1.0),  # 自适应生成“几种档位”
+    round_to: float = 1.0,            # 把 span 向上取整到多少米（保证“确定”）
+):
+    """
+    返回：
+      axis_limits_base: 最小档位对应的 (xmin,xmax,ymin,ymax) —— 作为 std box
+      tiers: 该场景离散倍率列表（用于替换 TIERS），保证所有 token 都只能落在这些倍率里
+      spans: 具体的 span 列表（米）
+      scene_center: (cx, cy)
+    """
+    base_tokens = np.asarray(base_tokens).astype(np.int32)
+    K = len(base_tokens)
+
+    # 1) 先对每个 token 跑一遍 sweep（不画图，只统计 bbox）
+    token_bboxes = []
+    token_centers = []
+
+    for k in range(K):
+        sweep_bins = choose_sweep_bins_in_valid_range(int(base_tokens[k]), k, n_points=n_points_bins)
+
+        token_batch = []
+        for b in sweep_bins:
+            t = base_tokens.copy()
+            t[k] = int(b)
+            token_batch.append(t)
+        token_batch = np.stack(token_batch, axis=0).astype(np.int32)  # [B,K]
+
+        centers = decode_tokens_to_center_traj(
+            tokenizer, token_batch, init_polygons, state_range, num_components, device=device
+        )  # [B,T,2]
+
+        xmin = float(np.min(centers[..., 0]))
+        xmax = float(np.max(centers[..., 0]))
+        ymin = float(np.min(centers[..., 1]))
+        ymax = float(np.max(centers[..., 1]))
+
+        token_bboxes.append((xmin, xmax, ymin, ymax))
+        token_centers.append(((xmin + xmax) / 2.0, (ymin + ymax) / 2.0))
+
+    # 2) 用“中位数中心”做 scene center（抗 outlier，避免一个 token 把中心拉歪）
+    cx = float(np.median([c[0] for c in token_centers]))
+    cy = float(np.median([c[1] for c in token_centers]))
+
+    # 3) 每个 token 相对 scene center 需要多大 span 才能包住
+    needed_spans = []
+    for (xmin, xmax, ymin, ymax) in token_bboxes:
+        max_dist_x = max(abs(xmin - cx), abs(xmax - cx))
+        max_dist_y = max(abs(ymin - cy), abs(ymax - cy))
+        span = max(max_dist_x, max_dist_y) * 2.0 + margin * 2.0
+        needed_spans.append(span)
+
+    needed_spans = np.asarray(needed_spans, dtype=np.float64)
+
+    # 4) 用分位数生成少量“固定 span 档位”
+    spans = np.quantile(needed_spans, quantiles).astype(np.float64)
+
+    # 向上取整到 round_to（让档位更“确定”、更规整）
+    spans = np.ceil(spans / round_to) * round_to
+
+    # 去重 + 排序 + 保证最后一个能 cover max
+    spans = sorted(set([float(s) for s in spans]))
+    spans[-1] = float(np.ceil(np.max(needed_spans) / round_to) * round_to)
+
+    base_span = spans[0]
+    half = base_span / 2.0
+    axis_limits_base = (cx - half, cx + half, cy - half, cy + half)
+
+    # 离散倍率（用于替换 TIERS）
+    tiers = [s / base_span for s in spans]
+    tiers[0] = 1.0  # 保底
+
+    return axis_limits_base, tiers, spans, (cx, cy)
+# ============================================================
+
+# ============================================================
+# 5) 从 all_datas.npy 的 dxdydyaw 做类别筛选（复用你上一段采样逻辑的“特征定义”）
+#    输出：features + 各类别 mask + 为每类选一个代表性 index
+# ============================================================
+def compute_motion_features(all_dxdydyaw_clips: np.ndarray, fps: float = 5.0, time_duration=None):
+    """
+    计算：net_yaw, gross_yaw, total_dist, avg_speed, sign_changes
+    这里的 total_dist / avg_speed 使用“把局部 dx,dy 转到全局”来算（与之前采样函数一致口径）
+    """
+    clips = np.asarray(all_dxdydyaw_clips)
+    N, T, _ = clips.shape
+    dxs = clips[:, :, 0]
+    dys = clips[:, :, 1]
+    dyaws = clips[:, :, 2]
+
+    cumulative_yaws = np.cumsum(dyaws, axis=1)  # [N,T]
+    prev_yaws = np.zeros((N, T), dtype=dxs.dtype)
+    prev_yaws[:, 1:] = cumulative_yaws[:, :-1]
+
+    net_yaw = cumulative_yaws[:, -1] if T > 0 else np.zeros(N, dtype=np.float32)
+    gross_yaw = np.sum(np.abs(dyaws), axis=1)
+
+    cos_y = np.cos(prev_yaws)
+    sin_y = np.sin(prev_yaws)
+    dx_g = cos_y * dxs - sin_y * dys
+    dy_g = sin_y * dxs + cos_y * dys
+
+    step_d = np.sqrt(dx_g**2 + dy_g**2)
+    total_dist = np.sum(step_d, axis=1)
+
+    duration = time_duration if time_duration is not None else (T / fps)
+    duration = max(float(duration), 1e-6)
+    avg_speed = total_dist / duration  # m/s
+
+    # dyaw 符号变化次数（粗略用于“绕行/S形”）
+    s = np.sign(dyaws)
+    s[s == 0] = 1
+    sign_changes = np.sum(s[:, 1:] != s[:, :-1], axis=1)
+
+    return {
+        "net_yaw": net_yaw,
+        "gross_yaw": gross_yaw,
+        "total_dist": total_dist,
+        "avg_speed": avg_speed,
+        "sign_changes": sign_changes,
+    }
+
+def select_multi_type_bases_from_all_datas(all_trajs: np.ndarray, fps: float = 5.0):
+    """
+    从 all_trajs=[N,25,3] 中筛选你要的 7 类，并为每类选一个代表样本 index。
+    返回 dict: name -> {"idx": int, "info": dict}
+    """
+    feat = compute_motion_features(all_trajs, fps=fps)
+
+    net_yaw = feat["net_yaw"]
+    gross_yaw = feat["gross_yaw"]
+    total_dist = feat["total_dist"]
+    avg_speed = feat["avg_speed"]
+    sign_changes = feat["sign_changes"]
+
+    # ---- 阈值（可按你数据分布微调）----
+    TH_DIST_STATIC = 1.0
+
+    TH_STRAIGHT_NET = 0.10
+    TH_STRAIGHT_GROSS = 0.20
+
+    # 速度阈值（m/s）
+    V_10 = 10.0 / 3.6
+    V_80 = 80.0 / 3.6
+    V_120 = 120.0 / 3.6
+
+    # 左/右转阈值
+    TH_TURN = 0.35            # >20度开始认为“转弯”
+    TH_UTURN = 2.35           # ~135度以上当“掉头/大回转”（你也可改成 3.0 更像180度）
+
+    # ---- 类别 mask ----
+    mask_static = (total_dist < TH_DIST_STATIC)
+
+    mask_straight = (np.abs(net_yaw) < TH_STRAIGHT_NET) & (gross_yaw < TH_STRAIGHT_GROSS) & (~mask_static)
+
+    mask_low_straight = mask_straight & (avg_speed >= (V_10 - 2/3.6)) & (avg_speed <= (V_10 + 2/3.6))
+    mask_high_straight = mask_straight & (avg_speed >= (V_80 - 10/3.6)) & (avg_speed <= (V_80 + 10/3.6))
+    mask_high_straight_120 = mask_straight & (avg_speed >= (V_120 - 15/3.6)) & (avg_speed <= (V_120 + 15/3.6))
+
+    mask_left = (net_yaw >= TH_TURN) & (np.abs(net_yaw) < TH_UTURN) & (~mask_static)
+    mask_right = (net_yaw <= -TH_TURN) & (np.abs(net_yaw) < TH_UTURN) & (~mask_static)
+
+    # 绕行：最终回正（net 小），但过程转向大（gross 大），且 dyaw 符号变化次数较多
+    mask_detour = (np.abs(net_yaw) < 0.20) & (gross_yaw >= 0.80) & (sign_changes >= 2) & (~mask_static)
+
+    # 掉头：净转角特别大
+    mask_uturn = (np.abs(net_yaw) >= TH_UTURN) & (~mask_static)
+
+    categories = {
+        "Stationary": mask_static,
+        "LowSpeedStraight_10kmh": mask_low_straight,
+        "HighSpeedStraight_80kmh": mask_high_straight,
+        "HighSpeedStraight_120kmh": mask_high_straight_120,
+        "LeftTurn": mask_left,
+        "RightTurn": mask_right,
+        "Detour": mask_detour,
+        "UTurn": mask_uturn,
+    }
+
+    # ---- 为每类选一个“代表性” index：用一个简单 score ----
+    out = {}
+    for name, m in categories.items():
+        idxs = np.where(m)[0]
+        if len(idxs) == 0:
+            out[name] = {"idx": None, "info": {"count": 0}}
+            continue
+
+        if name == "Stationary":
+            score = total_dist[idxs]  # 越小越静止
+        elif name == "LowSpeedStraight_10kmh":
+            score = np.abs(avg_speed[idxs] - V_10) + 0.5*np.abs(net_yaw[idxs]) + 0.2*gross_yaw[idxs]
+        elif name == "HighSpeedStraight_80kmh":
+            score = np.abs(avg_speed[idxs] - V_80) + 0.5*np.abs(net_yaw[idxs]) + 0.2*gross_yaw[idxs]
+        elif name == "HighSpeedStraight_120kmh":
+            score = np.abs(avg_speed[idxs] - V_120) + 0.5*np.abs(net_yaw[idxs]) + 0.2*gross_yaw[idxs]
+        elif name == "LeftTurn":
+            # 选一个“中等”左转：更稳（避免太极端）
+            score = np.abs(net_yaw[idxs] - 1.0) + 0.05*np.abs(avg_speed[idxs] - V_10)
+        elif name == "RightTurn":
+            score = np.abs(net_yaw[idxs] + 1.0) + 0.05*np.abs(avg_speed[idxs] - V_10)
+        elif name == "Detour":
+            # 绕行：更偏向 gross 大、sign_changes 多、net 小
+            score = (np.abs(net_yaw[idxs]) * 1.0) + (1.0 / (gross_yaw[idxs] + 1e-6)) + (1.0 / (sign_changes[idxs] + 1e-6))
+        elif name == "UTurn":
+            # 掉头：选 net_yaw 绝对值更接近 pi 的（更像180度）
+            score = np.abs(np.abs(net_yaw[idxs]) - np.pi)
+
+        best_local = int(idxs[np.argmin(score)])
+        out[name] = {
+            "idx": best_local,
+            "info": {
+                "count": int(len(idxs)),
+                "net_yaw": float(net_yaw[best_local]),
+                "gross_yaw": float(gross_yaw[best_local]),
+                "total_dist": float(total_dist[best_local]),
+                "avg_speed_mps": float(avg_speed[best_local]),
+                "avg_speed_kmh": float(avg_speed[best_local] * 3.6),
+                "sign_changes": int(sign_changes[best_local]),
+            }
+        }
+
+    return out
+
+
+# ============================================================
+# 6) 对每个类别：用其 base trajectory -> encode 得到 base_tokens，然后跑 sweep
+#    同时：先计算“全局 axis_limits”，保证所有图尺度一致
+# ============================================================
+def encode_base_tokens_from_traj(tokenizer, traj_25x3: np.ndarray, num_components: int):
+    """
+    traj_25x3: [25,3] -> base_tokens: [K]
+    """
+    toks = tokenizer(traj_25x3[None, ...], num_components=num_components)  # [1,K]
+    base_tokens = toks[0].astype(np.int32)
+
+    # 安全：clip 到你给的有效范围
+    for k in range(len(base_tokens)):
+        # base_tokens[k] = int(np.clip(base_tokens[k], TOKEN_MIN[k], TOKEN_MAX[k]))
+        base_tokens[k] = int(np.clip(base_tokens[k], 0, 1023))
+    return base_tokens
+
+def compute_global_axis_limits(
+    tokenizer,
+    base_tokens_dict: dict,   # name -> base_tokens
+    init_polygons: torch.Tensor,
+    state_range: float,
+    num_components: int,
+    device: str,
+    n_points: int = 8,
+    margin: float = 20.0,     # 保持 20.0 或 30.0，作为“标准视野”
+):
+    """
+    只计算 Base Trajectory 的范围作为“标准画框”。
+    """
+    xmin, xmax = 1e9, -1e9
+    ymin, ymax = 1e9, -1e9
+
+    for name, base_tokens in base_tokens_dict.items():
+        # 只解码 Base Token
+        token_batch = np.array([base_tokens], dtype=np.int32)
+
+        centers = decode_tokens_to_center_traj(
+            tokenizer, token_batch, init_polygons, state_range, num_components, device=device
+        )  # [1,T,2]
+
+        # 更新范围
+        xmin = min(xmin, float(np.min(centers[..., 0])))
+        xmax = max(xmax, float(np.max(centers[..., 0])))
+        ymin = min(ymin, float(np.min(centers[..., 1])))
+        ymax = max(ymax, float(np.max(centers[..., 1])))
+
+    # --- 强制正方形视野 ---
+    cx = (xmin + xmax) / 2.0
+    cy = (ymin + ymax) / 2.0
+
+    span_x = xmax - xmin
+    span_y = ymax - ymin
+
+    # 取长宽中较大者，并加上 margin
+    max_span = max(span_x, span_y) + margin * 2
+    half_span = max_span / 2.0
+
+    # 返回标准框 (Standard Box)
+    return (cx - half_span, cx + half_span, cy - half_span, cy + half_span)
+
+def run_scan_for_all_bases(
+    tokenizer,
+    all_trajs: np.ndarray,
+    init_polygons: torch.Tensor,
+    state_range: float,
+    num_components: int,
+    out_root: str,
+    device: str,
+    fps: float = 5.0,
+    n_points_bins: int = 8,
+):
+    os.makedirs(out_root, exist_ok=True)
+
+    # 1) 选每类 base trajectory index
+    base_sel = select_multi_type_bases_from_all_datas(all_trajs, fps=fps)
+
+    # 2) 为每类生成 base_tokens（由真实轨迹 encode 得到）
+    base_tokens_dict = {}
+    base_info_rows = []
+    for name, pack in base_sel.items():
+        idx = pack["idx"]
+        if idx is None:
+            print(f"[WARN] category={name} has 0 samples. skip.")
+            continue
+        base_traj = all_trajs[idx]  # [25,3]
+        base_tokens = encode_base_tokens_from_traj(tokenizer, base_traj, num_components=num_components)
+        base_tokens_dict[name] = base_tokens
+
+        row = {"category": name, "base_idx": int(idx), **pack["info"]}
+        base_info_rows.append(row)
+
+    # pd.DataFrame(base_info_rows).to_csv(os.path.join(out_root, "base_selection_summary.csv"), index=False)
+    print(f"[OK] Base selection summary saved: {os.path.join(out_root, 'base_selection_summary.csv')}")
+
+    if len(base_tokens_dict) == 0:
+        print("[ERROR] No valid base categories found. Nothing to run.")
+        return
+
+    # 3) 对每个类别跑 sweep
+    K = len(TOKEN_MIN)
+    for name, base_tokens in base_tokens_dict.items():
+        out_dir = os.path.join(out_root, name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # 只在这里算一次（不要放进 for k 循环里）
+        axis_limits_scene = compute_global_axis_limits(
+            tokenizer=tokenizer,
+            base_tokens_dict={name: base_tokens},   # 只用当前场景
+            init_polygons=init_polygons,
+            state_range=state_range,
+            num_components=num_components,
+            device=device,
+            n_points=n_points_bins,
+            margin=5.0,
+        )
+        print(f"[OK] {name} axis_limits_scene:", axis_limits_scene)
+
+        print(f"\n===== Running category base: {name} =====")
+        print("base_tokens:", base_tokens.tolist())
+
+        # --- 新增：每个场景只算一次“固定档位坐标轴池” ---
+        axis_limits_scene, tiers_scene, spans_scene, scene_center = compute_scene_axis_pool(
+            tokenizer=tokenizer,
+            base_tokens=base_tokens,
+            init_polygons=init_polygons,
+            state_range=state_range,
+            num_components=num_components,
+            device=device,
+            n_points_bins=n_points_bins,
+            margin=2.0,
+            # quantiles=(0.0, 0.6, 0.85, 0.95, 1.0),  # 你可以改成 3~6 个分位点 = “几种范围”
+            quantiles=(0.0, 0.5, 1.0),  # 你可以改成 3~6 个分位点 = “几种范围”
+            round_to=1.0,
+        )
+        print(f"[OK] {name} scene_center={scene_center}, spans={spans_scene}, tiers={tiers_scene}")
+
+        for k in range(K):
+            sweep_bins = choose_sweep_bins_in_valid_range(int(base_tokens[k]), k, n_points=n_points_bins)
+
+            interventional_sweep_one_dim(
+                tokenizer=tokenizer,
+                base_tokens=base_tokens,
+                sweep_dim=k,
+                sweep_bins=sweep_bins,
+                init_polygons=init_polygons,
+                state_range=state_range,
+                num_components=num_components,
+                out_dir=out_dir,
+                device=device,
+                title_prefix=f"[{name}] ",
+                axis_limits=axis_limits_scene,   # 固定 std box（场景级中心+最小 span）
+                tiers=tiers_scene,               # 固定离散档位（保证所有 token 只落在这几档）
+                fps=fps,
+            )
+
+
+        print(f"[DONE] category={name} saved to: {out_dir}")
+
+
+
+if __name__ == "__main__":
+    device = "cuda:0"
+    state_range = 400.0
+    num_components = 15
+    fps = 5.0
+
+    init_polygons = torch.tensor([[[-0.0061, -0.0025],
+                                   [ 0.0061, -0.0025],
+                                   [ 0.0061,  0.0025],
+                                   [-0.0061,  0.0025]]], device=device)
+
+    template_set_file = "/data-algorithm-hl/zhe.du/planner/plannn2/data_v3/tokenizer/dxdydyaw_pca_20token_1209/dxdydyaw_pca_tokenizer.json"
+    vehicle_tokenizer = PCATokenizer(template_set_file)
+
+    # 读取 all_datas.npy
+    datas = np.load("./all_datas.npy", allow_pickle=True).item()
+    all_trajs = datas["trajs"]  # [N,25,3]
+    print("all_trajs:", all_trajs.shape)
+
+    out_root = "./token_interventional_scan_outputs_multi_base3"
+
+    run_scan_for_all_bases(
+        tokenizer=vehicle_tokenizer,
+        all_trajs=all_trajs,
+        init_polygons=init_polygons,
+        state_range=state_range,
+        num_components=num_components,
+        out_root=out_root,
+        device=device,
+        fps=fps,
+        n_points_bins=20,
+    )
